@@ -1,0 +1,9 @@
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+streamlit>=1.30
+pytest>=7.4
+
+# Optional
+# pandas>=2.0      # nicer results tables in the GUI
+# plotly>=5.18     # if you want hover/zoom on the PSF instead of matplotlib

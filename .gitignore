@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.streamlit/secrets.toml
+.DS_Store
+
+figures/*.png
+figures/*.mp4
+figures/*.gif
+results/*
+presets/*.json
+!figures/.gitkeep
+!results/.gitkeep
+!presets/.gitkeep
+
+# supervisor's reference — must not reach the student
+_reference/
