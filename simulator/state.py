@@ -28,10 +28,12 @@ browser.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, replace, asdict, fields
 from typing import Any
 
 from uavsense.config import Scenario, URA
+
+import uavsense.formations
 
 __all__ = ["SimConfig", "ValidationError", "DEFAULT"]
 
@@ -113,6 +115,32 @@ class SimConfig:
         Validation belongs in `validate()` so the GUI can show a friendly message
         before anything expensive runs.
         """
+
+        # An URA object is defined with the values.
+        ura = URA(
+            n_x = self.ura_nx,
+            n_y = self.ura_ny,
+            spacing_wavelengths = self.ura_spacing,
+            steer_az_deg = self.ura_steer_az,
+            steer_el_deg = self.ura_steer_el,
+            enabled = self.ura_enabled
+        )
+
+        # A Scenario object is defined as well. It takes an URA object as well for an argument (I guess, we call it that).
+        scenario = Scenario(
+            f0 = self.f0_ghz * 1e9,
+            n_uav = self.n_uav,
+            altitude = self.altitude,
+            ground_range = self.ground_range,
+            aperture = self.aperture,
+            ura = ura,
+            grid_half_width = self.grid_half_width,
+            grid_points = self.grid_points
+        )
+
+        # The function returns scenario object.
+        return scenario
+    
         raise NotImplementedError("TODO(W02-1) in simulator/state.py")
 
     # =======================================================================
@@ -148,6 +176,61 @@ class SimConfig:
         WARNINGS. "25 drones with a 32x32 URA is 25600 elements and will take a
         few seconds" is worth saying without blocking the run.
         """
+
+        # Defining the list that contains all the problems.
+
+        problem_list = []
+
+        # Starting to check for potential problems.
+
+        if(not(uavsense.formations.valid_count(self.formation, self.n_uav))):
+            suggestion = uavsense.formations.nearest_valid_count(self.formation, self.n_uav)
+            problem_list.append(f"The Number of UAVs provided for {self.formation} Formation is incorrect. Try changing Number of UAVs to {suggestion}.")
+
+        if(self.n_uav < 2):
+            problem_list.append("The UAV count should not be less than 2.")
+
+        if(self.n_uav > 64):
+            problem_list.append("The UAV count should not be above 64 as it slows down PSF.")
+
+        if(self.aperture <= 0):
+            problem_list.append("Aperture must be greater than 0.")
+
+        if(self.ura_nx < 1 or self.ura_nx > 32):
+            problem_list.append("Please keep the number of elements across the drone in X direction from 1 to 32.")
+
+        if(self.ura_ny < 1 or self.ura_ny > 32):
+            problem_list.append("Please keep the number of elements across the drone in Y direction from 1 to 32.")
+
+        if(self.ura_spacing <= 0):
+            problem_list.append("Please keep Spacing (URA) between 0 and 0.5 as if it goes above 0.5, URA will start producing grating lobes.")
+
+        if(self.n_snapshots < 1):
+            problem_list.append("Snapshot count can't be less than 1.")
+
+        if(self.strategy not in uavsense.sequences.SEQUENCE_STRATEGIES):
+            problem_list.append("Invalid Strategy is Used.")
+
+        if(self.n_drop >= self.n_uav):
+            problem_list.append("You can't drop all Drones or more Drones than you have.")
+
+        if(self.grid_points % 2 == 0):
+            problem_list.append("Number of grid points can't be EVEN.")
+        
+        if(self.grid_points < 51):
+            problem_list.append("Number of Grid Points should be at least 51.")
+        elif(self.grid_points > 801):
+            problem_list.append("Number of Grid points being above 801 will result in slow processing.")
+
+        if(self.altitude <= 0):
+            problem_list.append("Altitude can't be a negative value.")
+
+        if(self.ground_range <= 0):
+            problem_list.append("Ground Range can't be negative.")
+
+
+        return problem_list
+
         raise NotImplementedError("TODO(W02-2) in simulator/state.py")
 
     def is_valid(self) -> bool:
@@ -165,6 +248,12 @@ class SimConfig:
         Add a "version" key — you WILL change these fields in week 8, and a
         preset saved in week 5 should still load rather than crash.
         """
+
+        sim_dict = asdict(self)
+        sim_dict.update({'version': 1})
+
+        return sim_dict
+
         raise NotImplementedError("TODO(W02-3a) in simulator/state.py")
 
     @classmethod
@@ -181,6 +270,16 @@ class SimConfig:
 
         Round-tripping is tested: from_dict(to_dict(cfg)) == cfg.
         """
+
+        known_keys = {f.name for f in fields(cls)}     # This will give me the list of attributes of SimConfig Class that are present in that version.
+
+        sim_args = {}
+        for key, value in d.items():
+            if(key in known_keys):
+                sim_args.update({key: value})           # We only pass known arguments, other we skip or we let the default values be assigned.
+
+        return cls(**sim_args)
+
         raise NotImplementedError("TODO(W02-3b) in simulator/state.py")
 
     # =======================================================================
