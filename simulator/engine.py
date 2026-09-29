@@ -2,7 +2,7 @@
 The compute layer — turns a SimConfig into a Result, and does it fast enough.
 
 ============================================================================
-YOU BUILD THIS.  Search for "TODO(" to find your tasks.
+YOU BUILD THIS.
 ============================================================================
 
 WHAT THIS LAYER IS FOR
@@ -46,22 +46,28 @@ are apologising for — the numbers are the same.
     fine     (401x401)  only for an exported figure
 
 Those are for the PSF alone. `measure()` computes it AGAIN, so a naive `run()`
-doubles every number above — which is the trap flagged in TODO(W03-3).
+doubles every number above — which is the trap flagged in (W03-3).
 
 Build `run(config, preview=True/False)` around that from the start; retrofitting
 it later means touching every call site.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
+from time import perf_counter
 
 import numpy as np
 
 from uavsense.config import Scenario
-from uavsense.imaging import PSFMetrics
+from uavsense.imaging import PSFMetrics, point_spread_function, measure
+from uavsense.formations import get_formation
+from uavsense.errors import apply_errors
+from uavsense.sequences import build_sequence
+from uavsense.costs import sequence_weights
+from uavsense.coarray import fused_coarray, coarray_gain
 
-from .state import SimConfig
+from .state import SimConfig, ValidationError, Scenario
 
 __all__ = ["Result", "run", "build_snapshots", "clear_cache", "cache_stats",
            "estimate_cost"]
@@ -114,7 +120,6 @@ class Result:
 
 
 # ---------------------------------------------------------------------------
-# TODO(W03-2)
 # ---------------------------------------------------------------------------
 def build_snapshots(config: SimConfig) -> tuple[list[np.ndarray], list[np.ndarray],
                                                 list[np.ndarray]]:
@@ -126,26 +131,23 @@ def build_snapshots(config: SimConfig) -> tuple[list[np.ndarray], list[np.ndarra
     thinks they are. They differ only when position error is switched on, and
     that difference is the whole reason `coherent_gain` responds to error at all.
 
-    TODO(W03-2): Implement this.
-      1. base = uavsense.formations.get_formation(config.formation, n_uav, aperture)
-         (pass seed=config.seed when the formation is "random")
-      2. seq = uavsense.sequences.build_sequence(base, config.strategy,
-                  config.n_snapshots, config.aperture, rng, config.shift_fraction,
-                  config.rotate_total_deg)
-      3. uavsense.errors.apply_errors(seq, sigma_pos, sigma_phase, n_drop, seed)
-         — note sigma_pos_lambda is in WAVELENGTHS and apply_errors wants METRES,
-         so multiply by the wavelength. Getting this wrong by a factor of 30 is
-         an easy mistake and the symptom (nothing seems to degrade) looks like a
-         physics problem rather than a units problem.
-
-    Keep this separate from `run` so you can unit-test the sequence logic without
-    computing a single PSF.
     """
-    raise NotImplementedError("TODO(W03-2) in simulator/engine.py")
+    if config.formation == "random":
+        base = get_formation(config.formation, config.n_uav, config.aperture, seed=config.seed)
+    else:
+        base = get_formation(config.formation, config.n_uav, config.aperture)
+
+    rng = np.random.default_rng(config.seed)
+    seq = build_sequence(base, config.strategy, config.n_snapshots, config.aperture, rng, config.shift_fraction, config.rotate_total_deg)
+
+    wavelength = config.to_scenario().wavelength
+    sigma_pos_metres = config.sigma_pos_lambda * wavelength
+
+    return apply_errors(seq, sigma_pos_metres, config.sigma_phase_rad, config.n_drop, config.seed)
+
 
 
 # ---------------------------------------------------------------------------
-# TODO(W03-3)
 # ---------------------------------------------------------------------------
 def run(config: SimConfig, preview: bool = False,
         progress: Callable[[float, str], None] | None = None) -> Result:
@@ -159,32 +161,74 @@ def run(config: SimConfig, preview: bool = False,
         the slow paths. Call it sparingly — a callback per grid row will make the
         run slower than the physics.
 
-    TODO(W03-3): Implement this.
-      1. cfg validation: if config.validate() is non-empty, raise ValidationError.
-         Fail here, not deep inside numpy where the message is unreadable.
-      2. check the cache (see TODO(W03-4)); return the hit with from_cache=True
-      3. scenario = config.to_scenario(); if preview, replace() its grid_points
-         with something coarse (101 is a good default)
-      4. actual, nominal, phases = build_snapshots(config)
-      5. weights: all 1.0, unless config.apply_coherence_cost, in which case use
-         uavsense.costs.sequence_weights(...)
-      6. axis, image = point_spread_function(actual, scenario, weights, phases)
-      7. metrics = measure(actual, scenario, weights, phases, nominal=nominal)
-         — passing `nominal` is what makes peak_gain meaningful
-      8. coarray = uavsense.coarray.fused_coarray(actual)
-      9. time it with time.perf_counter, store compute_ms, cache it, return
 
-    A REAL TRAP: steps 6 and 7 both compute the PSF, so the naive version does
-    the expensive work TWICE. Notice it now rather than wondering later why the
+    A REAL TRAP: Measure() and point_spread_function() both compute the PSF, so the naive 
+    version does the expensive work TWICE. Notice it now rather than wondering later why the
     app feels sluggish. Either compute the image once and derive the metrics from
     it yourself, or accept the cost and note it in a comment — but decide
     deliberately rather than by accident.
+
+    *****
+    My solution for the above-mentioned problem is to change the measure() function itself,
+    such that it accepts image and axis as parameters rather than it calls point_spread_function().
+    I am not doing it right now as I require permission of whether or not I could change it.
     """
-    raise NotImplementedError("TODO(W03-3) in simulator/engine.py")
+
+    global _CACHE
+    global _HITS
+    global _MISSES    
+
+    problems = config.validate()
+    if problems:
+        problem_string = ""
+        for idx, problem in enumerate(problems):
+            problem_string += f"{idx + 1}. {problem}\n"
+        raise ValidationError(problem_string)
+
+    key = (config.cache_key(), preview)
+    
+    
+    
+    if key in _CACHE.keys():
+        _HITS += 1
+        cached = _CACHE[key]
+        return replace(cached, from_cache=True)
+    else:
+        start = perf_counter()
+        _MISSES += 1
+        if(preview):
+            scenario = replace(config.to_scenario(), grid_points=101)
+        else:
+            scenario = config.to_scenario()
+
+        snapshot_data = build_snapshots(config)
+        actual = snapshot_data[0]
+        nominal = snapshot_data[1]
+        phase_errors = snapshot_data[2]
+
+        if(config.apply_coherence_cost):
+            (weights, morph_times) = sequence_weights(actual, config.drone_speed, config.allan_dev, scenario.f0)
+        else:
+            weights = list(np.ones(config.n_snapshots))
+            morph_times = list(np.zeros_like(weights))
+
+        (axis, image) = point_spread_function(actual, scenario, weights, phase_errors)
+
+        metrics = measure(actual, scenario, weights, phase_errors, nominal)
+        coarray = fused_coarray(actual)
+        gain = coarray_gain(actual)
+
+        end = perf_counter()
+
+        elapsed_time = (end - start)*1000
+
+        result = Result(config, scenario, actual, nominal, weights, morph_times, axis, image, metrics, coarray, gain, elapsed_time, from_cache=False, preview=preview)
+        _CACHE.update({key: result})
+
+        return result
 
 
 # ---------------------------------------------------------------------------
-# TODO(W03-4)
 # ---------------------------------------------------------------------------
 _CACHE: dict = {}
 _HITS = 0
@@ -194,10 +238,14 @@ _MISSES = 0
 def clear_cache() -> None:
     """
     Empty the cache. The GUI wants this on a button.
-
-    TODO(W03-4a): Implement. Reset the hit/miss counters too.
     """
-    raise NotImplementedError("TODO(W03-4a) in simulator/engine.py")
+    global _CACHE
+    global _HITS
+    global _MISSES
+
+    _CACHE = {}
+    _HITS = 0
+    _MISSES = 0
 
 
 def cache_stats() -> dict:
@@ -206,18 +254,22 @@ def cache_stats() -> dict:
     rate while you use the app teaches you more about your own cache key than any
     amount of reasoning.
 
-    TODO(W03-4b): Implement.
-
-    Then go and look at it: if the hit rate stays near zero while you drag a
-    slider back and forth over values you have already visited, something in your
-    key is changing when it should not. (The classic culprit is a float that
-    accumulates rounding, or the label sneaking in.)
     """
-    raise NotImplementedError("TODO(W03-4b) in simulator/engine.py")
+
+    hit_rate = 0 if ((_HITS + _MISSES) == 0) else (_HITS/(_HITS + _MISSES))
+    entries = len(_CACHE)
+
+    cache_stats = {
+        'hits': _HITS,
+        'misses': _MISSES,
+        'hit_rate': hit_rate,
+        'entries': entries
+    }
+
+    return cache_stats
 
 
 # ---------------------------------------------------------------------------
-# TODO(W03-5)
 # ---------------------------------------------------------------------------
 def estimate_cost(config: SimConfig, preview: bool = False) -> float:
     """
@@ -226,18 +278,17 @@ def estimate_cost(config: SimConfig, preview: bool = False) -> float:
     The GUI uses this to decide whether to compute immediately or show a "Compute"
     button — an estimate over ~0.5 s means don't do it on every slider drag.
 
-    TODO(W03-5): Implement. Cost is dominated by the range computation, which is
-    grid_points^2 * n_uav * n_snapshots. The URA is nearly free thanks to the
-    Dirichlet trick, so element count barely enters.
-
-      1. Time one small reference run once, and cache the constant.
-      2. Scale it: cost = k * grid_points^2 * n_uav * n_snapshots
-      3. Sanity-check the prediction against reality for a few configurations and
-         write down how close it gets. A cost model you have not checked is a
-         guess with a decimal point on it.
     """
-    raise NotImplementedError("TODO(W03-5) in simulator/engine.py")
 
+    k = 2.6936e-07         # I identified this value after comparing the values resulted from 100 test runs on different configs.
+
+    if(preview):
+        cost = k * (101 ** 2) * config.n_uav * config.n_snapshots
+    else:
+        cost = k * (config.grid_points ** 2) * config.n_uav * config.n_snapshots
+        
+    return cost
+    
 
 # ---------------------------------------------------------------------------
 # TODO(W11-1) — batch sweeps, week 11
